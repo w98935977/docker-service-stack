@@ -6,9 +6,11 @@ Raspberry Pi 5 ARM64 可運行的 Docker Compose 範例：
 Client -> Nginx -> FastAPI/Uvicorn -> PostgreSQL
 ```
 
+這個專案用單機 Docker Compose 示範 reverse proxy、雙 network 隔離、service health dependency、PostgreSQL named volume persistence，以及可驗證的 backup / restore 流程。
+
 ## 需求
 
-- Raspberry Pi 5，建議 64-bit Raspberry Pi OS / Ubuntu Server ARM64
+- Raspberry Pi 5，64-bit Raspberry Pi OS / Ubuntu Server ARM64
 - Docker Engine
 - Docker Compose v2
 
@@ -16,10 +18,34 @@ Client -> Nginx -> FastAPI/Uvicorn -> PostgreSQL
 
 ```bash
 cp .env.example .env
-# 編輯 .env，至少修改 POSTGRES_PASSWORD
+# 編輯 .env，設定 POSTGRES_PASSWORD
+docker compose config
 docker compose up -d --build
+./scripts/wait_for_stack.sh
 docker compose ps
-curl http://localhost:8080/health
+```
+
+`POSTGRES_PASSWORD` 沒有預設值。若未設定，Compose 會直接拒絕啟動，避免以弱密碼意外部署。
+
+## 整體架構
+
+```text
+Client
+  |
+  | TCP/8080
+  v
+Nginx
+  |
+  | frontend network
+  v
+FastAPI / Uvicorn
+  |
+  | backend network
+  v
+PostgreSQL
+  |
+  v
+db-data named volume
 ```
 
 ## 服務說明
@@ -32,30 +58,99 @@ curl http://localhost:8080/health
 
 ## Network 設計
 
-- `frontend`：只給 `nginx` 與 `app` 溝通。
-- `backend`：只給 `app` 與 `db` 溝通。
-- `db` 不對 host 開 port，降低不必要暴露面。
+- `frontend`：只提供 `nginx` 與 `app` 溝通。
+- `backend`：只提供 `app` 與 `db` 溝通。
+- `db` 不 publish host port，避免不必要的資料庫暴露。
+- `app` 同時位於兩個 network，作為 reverse proxy 與 database 之間唯一的 application path。
+
+## Request Flow
+
+```text
+curl http://HOST:8080/health
+        |
+        v
+      Nginx
+        |
+        v
+ FastAPI /health
+        |
+        v
+ PostgreSQL SELECT 1
+```
+
+FastAPI 的 `/health` 會實際執行 `SELECT 1`，因此 HTTP 200 代表 application process 與 database connection 都可用。
 
 ## Startup dependency
 
-Docker Compose 使用 healthcheck 與 `depends_on.condition` 控制基本啟動順序：
+Docker Compose 使用 healthcheck 與 `depends_on.condition: service_healthy` 控制啟動順序：
 
 ```text
 PostgreSQL healthy -> FastAPI /health healthy -> Nginx start
 ```
 
-注意：這不是完整的 service orchestration，只是單機 Compose 環境下的合理啟動保護。
+這是單機 Compose 的 startup sequencing，不是完整的 service orchestration。
 
-## 資料持久化
+## Healthcheck 與 restart policy
 
-PostgreSQL 資料寫入 named volume：
+三個 service 都設定：
+
+```yaml
+restart: unless-stopped
+```
+
+但需要注意：Docker healthcheck 變成 `unhealthy` 並不等於 process exit，因此不一定觸發 restart policy。
+
+例如 PostgreSQL 中斷時：
+
+```text
+PostgreSQL unavailable
+        |
+        v
+FastAPI /health -> HTTP 503
+        |
+        v
+app container -> unhealthy
+```
+
+此時 Uvicorn process 仍可能存活，所以 Docker 不會只因 health state 為 unhealthy 自動重啟 App。
+
+## Failure scenarios
+
+### PostgreSQL unavailable
+
+- FastAPI `/health` 回傳 HTTP 503。
+- App container health state 變為 unhealthy。
+- Nginx `/health` 也會因 upstream health endpoint 失敗而失敗。
+
+### FastAPI process exits
+
+- `restart: unless-stopped` 會重新啟動 App container。
+- App 恢復前，Nginx 可能暫時回傳 upstream error。
+
+### Nginx process exits
+
+- `restart: unless-stopped` 會重新啟動 Nginx container。
+
+### `docker compose down`
+
+- Containers 與 Compose networks 被移除。
+- `db-data` named volume 保留。
+
+### `docker compose down -v`
+
+- Containers、networks 與 `db-data` volume 一併移除。
+- PostgreSQL data 會被刪除。
+
+## PostgreSQL persistence
+
+PostgreSQL data 寫入 named volume：
 
 ```yaml
 volumes:
   - db-data:/var/lib/postgresql/data
 ```
 
-即使 `docker compose down`，只要沒有執行 `docker compose down -v`，資料仍會保留。
+即使執行 `docker compose down`，只要沒有加 `-v`，資料仍會保留。
 
 ## Backup
 
@@ -63,11 +158,13 @@ volumes:
 ./scripts/backup_postgres.sh
 ```
 
-備份檔會輸出到：
+備份檔輸出到：
 
 ```text
 backups/service_db-YYYYmmdd-HHMMSS.sql.gz
 ```
+
+Backup script 直接使用 DB container 內的 `POSTGRES_DB` / `POSTGRES_USER`，不會 `source .env`。Dump 使用 `--clean --if-exists --no-owner --no-privileges`，方便回復到同一個 application database。
 
 ## Restore
 
@@ -81,7 +178,30 @@ backups/service_db-YYYYmmdd-HHMMSS.sql.gz
 make restore FILE=backups/service_db-YYYYmmdd-HHMMSS.sql.gz
 ```
 
+Restore 流程：
+
+```text
+Confirm
+  -> stop Nginx/App
+  -> psql -v ON_ERROR_STOP=1
+  -> start App/Nginx
+  -> wait for /health
+```
+
+若 SQL restore 發生錯誤，`psql` 會立即回傳失敗，不會把部分失敗的 restore 誤報為成功。
+
 ## 常用指令
+
+```bash
+make up
+make ps
+make health
+make logs
+make backup
+make down
+```
+
+或直接使用：
 
 ```bash
 docker compose up -d --build
@@ -99,12 +219,31 @@ curl -X POST http://localhost:8080/events/hello-pi5
 curl http://localhost:8080/events
 ```
 
+## CI
+
+GitHub Actions 會執行：
+
+```text
+Compose config validation
+-> Python syntax check
+-> Bash syntax check
+-> docker compose up --build
+-> healthcheck smoke test
+-> API write/read test
+-> PostgreSQL backup
+-> PostgreSQL restore
+```
+
 ## 檔案結構
 
 ```text
 docker-service-stack/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
 ├── docker-compose.yml
 ├── .env.example
+├── .gitignore
 ├── README.md
 ├── Makefile
 ├── app/
