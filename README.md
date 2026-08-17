@@ -1,12 +1,43 @@
 # docker-service-stack
 
-Raspberry Pi 5 ARM64 可運行的 Docker Compose 範例：
+[![CI](https://github.com/w98935977/docker-service-stack/actions/workflows/ci.yml/badge.svg)](https://github.com/w98935977/docker-service-stack/actions/workflows/ci.yml)
+
+**Raspberry Pi 5 / ARM64 實機驗證的 Docker Compose 三層服務架構。**
 
 ```text
 Client -> Nginx -> FastAPI/Uvicorn -> PostgreSQL
 ```
 
-這個專案用單機 Docker Compose 示範 reverse proxy、雙 network 隔離、service health dependency、PostgreSQL named volume persistence，以及可驗證的 backup / restore 流程。
+這個專案不是單純把三個 container 啟動起來，而是用單機 Docker Compose 實作並驗證：reverse proxy、雙 network 隔離、service health dependency、restart policy、PostgreSQL named volume persistence，以及可驗證的 backup / restore 流程。
+
+## 專案重點
+
+- **Nginx** 作為唯一對外 HTTP entry point，host 僅 publish `8080`。
+- **FastAPI / Uvicorn** 同時連接 `frontend` 與 `backend` network，作為唯一 application path。
+- **PostgreSQL** 僅位於 `backend` network，不直接暴露 host `5432`。
+- 以 healthcheck 實作 `DB healthy -> App healthy -> Nginx` 的 startup sequencing。
+- `restart: unless-stopped` 處理 container process exit 後的自動復原。
+- `db-data` named volume 保存 PostgreSQL data，container recreate 後資料仍可保留。
+- Backup / restore scripts 使用 `pg_dump`、`psql -v ON_ERROR_STOP=1`，避免 restore 失敗後誤報成功。
+- GitHub Actions 會實際啟動完整 stack，執行 API、backup、restore 與 post-restore smoke test。
+
+## Raspberry Pi 5 實機驗證
+
+以下項目已在 Raspberry Pi 5 上實際執行：
+
+| 驗證項目 | 結果 |
+|---|---|
+| Docker Compose build / startup | PASS |
+| Nginx -> FastAPI -> PostgreSQL request flow | PASS |
+| DB / App / Nginx healthcheck | PASS |
+| API write / read | PASS |
+| App process crash 後由 restart policy 自動恢復 | PASS |
+| PostgreSQL container recreate 後資料保留 | PASS |
+| PostgreSQL backup 產生 `.sql.gz` | PASS |
+
+另外，GitHub Actions CI 會驗證 PostgreSQL restore 與 restore 後的 API/data 狀態。
+
+實機測試中也曾發現 Alpine container 內 `localhost` 優先解析為 IPv6 `::1`，造成 Nginx healthcheck 誤判；最後將 self-check 明確改為 `127.0.0.1`。這個修正保留在 Git history / PR 中，可呈現從觀察、定位到修正的 troubleshooting 過程。
 
 ## 需求
 
@@ -232,6 +263,7 @@ Compose config validation
 -> API write/read test
 -> PostgreSQL backup
 -> PostgreSQL restore
+-> post-restore verification
 ```
 
 ## 檔案結構
