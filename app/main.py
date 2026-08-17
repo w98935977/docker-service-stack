@@ -1,19 +1,33 @@
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import psycopg
 from fastapi import FastAPI, HTTPException
 
 APP_NAME = os.getenv("APP_NAME", "docker-service-stack")
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-app = FastAPI(title=APP_NAME)
+
+def db_connection_parameters() -> dict[str, object]:
+    required = {
+        "host": os.getenv("PGHOST"),
+        "dbname": os.getenv("PGDATABASE"),
+        "user": os.getenv("PGUSER"),
+        "password": os.getenv("PGPASSWORD"),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(f"Missing PostgreSQL settings: {', '.join(missing)}")
+
+    return {
+        **required,
+        "port": int(os.getenv("PGPORT", "5432")),
+        "connect_timeout": 3,
+    }
 
 
 def db_query(sql: str, params: tuple = ()):
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not configured")
-    with psycopg.connect(DATABASE_URL, connect_timeout=3) as conn:
+    with psycopg.connect(**db_connection_parameters()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             if cur.description:
@@ -22,8 +36,8 @@ def db_query(sql: str, params: tuple = ()):
             return None
 
 
-@app.on_event("startup")
-def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     db_query(
         """
         CREATE TABLE IF NOT EXISTS service_events (
@@ -33,6 +47,10 @@ def startup() -> None:
         )
         """
     )
+    yield
+
+
+app = FastAPI(title=APP_NAME, lifespan=lifespan)
 
 
 @app.get("/")
